@@ -102,6 +102,11 @@ struct event_pool_t {
   std::mutex event_pool_mutex;
 };
 
+typedef enum {
+  TORCH_UCC_COLL_ORDER_FIFO = 0,
+  TORCH_UCC_COLL_ORDER_CUSTOM
+} torch_ucc_collective_order_t;
+
 class CommPG;
 
 class ProcessGroupUCC : public ProcessGroup {
@@ -175,6 +180,9 @@ class ProcessGroupUCC : public ProcessGroup {
 #endif
    protected:
     std::shared_ptr<ProgressEntry> entry_;
+    int batch_num;
+    int coll_num;
+    int coll_priority;
    private:
     // The future returned by getFuture.
     c10::intrusive_ptr<at::ivalue::Future> future_;
@@ -293,6 +301,13 @@ class ProcessGroupUCC : public ProcessGroup {
   std::unique_ptr<at::cuda::CUDAStream> stream = nullptr;
   event_pool_t ep;
 #endif
+  int colls_per_iter;
+  int total_batches;
+  int batch_num_curr;
+  int coll_num_curr;
+  int batch_num_next_exec;
+  int coll_priority_next_exec;
+  bool update_next_exec;
 };
 
 class CommPG {
@@ -304,6 +319,7 @@ class CommPG {
   std::condition_variable queue_produce_cv;
   std::condition_variable queue_consume_cv;
   std::deque<std::shared_ptr<ProcessGroupUCC::ProgressEntry>> progress_queue;
+  std::deque<std::shared_ptr<ProcessGroupUCC::WorkUCC>> request_queue;
   bool stop_progress_loop;
   bool collective_inprogress;
 

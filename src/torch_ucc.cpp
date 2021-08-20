@@ -10,6 +10,7 @@
 
 #include "torch_ucc.hpp"
 #include <memory>
+#include <fstream>
 
 namespace c10d {
 
@@ -60,6 +61,9 @@ struct torch_ucc_config_t {
   std::array<bool, 32> blocking_wait;
   bool enable_profiling;
   bool use_future;
+  torch_ucc_collective_order_t coll_order;
+  std::vector<int> coll_permutation;
+  std::vector<int> coll_priorities;
 } torch_ucc_config;
 
 void read_confg() {
@@ -96,6 +100,28 @@ void read_confg() {
   env = std::getenv("TORCH_UCC_PROFILING_ENABLE");
   if (env) {
     torch_ucc_config.enable_profiling = std::atoi(env);
+  }
+
+  torch_ucc_config.coll_order = TORCH_UCC_COLL_ORDER_FIFO;
+  env = std::getenv("TORCH_UCC_COLL_ORDER");
+  if (env) {
+    std::ifstream _coll_order_file(env);
+    if (_coll_order_file.is_open()) {
+      config.coll_order = TORCH_UCC_COLL_ORDER_CUSTOM;
+      std::vector<int> _coll_permutation;
+      int _coll_num;
+      while (_coll_order_file >> _coll_num) {
+        _coll_permutation.push_back(_coll_num);
+      }
+      std::vector<int> _coll_priorities(_coll_permutation.size());
+      int _coll_priority = 1;
+      for (int _coll_num: _coll_permutation) {
+        _coll_priorities.at(_coll_num-1) = _coll_priority++;
+      }
+      config.coll_permutation = _coll_permutation;
+      config.coll_priorities = _coll_priorities;
+    }
+    _coll_order_file.close();
   }
 }
 
@@ -487,6 +513,90 @@ void CommPG::enqueue_cuda_collective(
   lock.unlock();
   queue_produce_cv.notify_one();
 }
+
+void ProcessGroupUCC::collective_reorder(
+    ucc_coll_req_h & request) {
+
+  int coll_priority_curr;
+  if (torch_ucc_config.coll_order == TORCH_UCC_COLL_ORDER_CUSTOM) {
+    if (total_batches == 0) {
+      total_batches = at::getTotalBatches();
+    }
+    coll_num_curr++;
+    int _batch_num = at::getBatchNum();
+    if (_batch_num > batch_num_curr) {
+      coll_num_curr = 1;
+      batch_num_curr = _batch_num;
+      // LOG(INFO) << "debug: Rank " << rank_ << ": NEW BATCH: " << batch_num_curr;
+    }
+    if (batch_num_curr > 2 && batch_num_curr < (total_batches - 1)) {
+      coll_priority_curr = torch_ucc_config.coll_priorities.at(coll_num_curr-1);
+    } else {
+      coll_priority_curr = coll_num_curr;
+    }
+  } else {
+    coll_num_curr++;
+    coll_priority_curr = coll_num_curr;
+  }
+
+  std::unique_lock<std::mutex> lock(mutex);
+
+  auto iter = progress_queue.end();
+  if (torch_ucc_config.coll_order == TORCH_UCC_COLL_ORDER_CUSTOM) {
+    auto pos = progress_queue.begin();
+    for (; (pos != progress_queue.end()) &&
+           (((*pos)->batch_num < batch_num_curr) ||
+            (((*pos)->batch_num == batch_num_curr) && ((*pos)->coll_priority <= coll_priority_curr))
+           );
+        pos++);
+    iter = progress_queue.emplace(
+      pos,
+      c10::make_intrusive<ProcessGroupUCC::ProgressEntry>(
+        &ucc_comm, request);
+  } else {
+    iter = progress_queue.emplace(
+      progress_queue.end(),
+      c10::make_intrusive<ProcessGroupUCC::ProgressEntry>(
+        &ucc_comm, request);
+  }
+
+  (*iter)->work_list_entry = iter;
+  (*iter)->coll_req = req;
+  (*iter)->blocking_wait = torch_ucc_config.blocking_wait[req->coll_type];
+  (*iter)->external_progress = torch_ucc_config.enable_progress_thread;
+  // (*iter)->scratch = (char*)scratch;
+  (*iter)->batch_num = batch_num_curr;
+  (*iter)->coll_num = coll_num_curr;
+  (*iter)->coll_priority = coll_priority_curr;
+  auto workreq = (*iter);
+
+  if (update_next_exec) {
+    auto work_coll = progress_list.front();
+    coll_priority_next_exec++;
+    if (batch_num_next_exec < work_coll->batch_num) {
+      batch_num_next_exec = work_coll->batch_num;
+      coll_priority_next_exec = 1;
+    }
+    update_next_exec = false;
+  }
+
+  // if (rank_ == 0) {
+    // LOG(INFO) << "debug: RANK " << rank_ << ": ENQUEUED COLLECTIVE: " <<
+    //              torch_ucc_collective_name.at(req->coll_type) <<
+    //              ": PROGRESS LIST SIZE: " <<
+    //              progress_list.size() <<
+    //              ": batch: " << (*iter)->batch_num <<
+    //              ": coll_num: " << (*iter)->coll_num <<
+    //              ": coll_priority: " << (*iter)->coll_priority <<
+    //              ": batch_num_next_exec: " << batch_num_next_exec <<
+    //              ": coll_priority_next_exec: " << coll_priority_next_exec;
+  // }
+
+  lock.unlock();
+  queue_produce_cv.notify_one();
+  return workreq;
+}
+
 #endif
 
 void CommPG::progress_loop() {
@@ -501,7 +611,31 @@ void CommPG::progress_loop() {
     }
     collective_inprogress = true;
     auto work = progress_queue.front();
-    progress_queue.pop_front();
+    // re-schdeuling
+    if (torch_ucc_config.coll_order == TORCH_UCC_COLL_ORDER_CUSTOM) {
+      if (update_next_exec) {
+        coll_priority_next_exec++;
+        if (batch_num_next_exec < work->batch_num) {
+          batch_num_next_exec = work->batch_num;
+          coll_priority_next_exec = 1;
+        }
+        update_next_exec = false;
+      }
+      if (work->batch_num == batch_num_next_exec && work->coll_priority == coll_priority_next_exec) {
+        progress_queue.pop_front();
+        update_next_exec = true;
+      } else {
+        // LOG(INFO) << "debug: RANK " << rank_ << ": WAIT FOR NEXT IN PERMUTATION " <<
+        //              ": batch_num_next_exec " << batch_num_next_exec <<
+        //              ": coll_priority_next_exec " << coll_priority_next_exec;
+        queue_consume_cv.wait(lock);
+        continue;
+      }
+    } else {
+      coll_priority_next_exec++;
+      progress_queue.pop_front();
+    }
+    //
     lock.unlock();
 #ifdef USE_CUDA
     if ((!device_set) && (cuda_device_index != TORCH_UCC_DEVICE_NOT_SET)) {
@@ -540,6 +674,22 @@ ProcessGroupUCC::ProcessGroupUCC(
   oob.store = store;
   comm = nullptr;
   cuda_ee = nullptr;
+
+  if (torch_ucc_config.coll_order == TORCH_UCC_COLL_ORDER_CUSTOM) {
+    colls_per_iter = torch_ucc_config.coll_permutation.size();
+    total_batches = 0;
+    batch_num_curr = 0;
+    coll_num_curr = 0;
+    batch_num_next_exec = 0;
+    coll_priority_next_exec = 1;
+    update_next_exec = false;
+  } else {
+    batch_num_curr = 0;
+    coll_num_curr = 0;
+    batch_num_next_exec = 0;
+    coll_priority_next_exec = 1;
+    update_next_exec = false;
+  }
 }
 
 ProcessGroupUCC::~ProcessGroupUCC() {
